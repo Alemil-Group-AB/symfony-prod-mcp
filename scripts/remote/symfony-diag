@@ -1,0 +1,1334 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/**
+ * symfony-diag (remote runner)
+ *
+ * Reads JSON from STDIN:
+ *   {"action":"logs.tail","params":{"lines":200,"file":"prod.log"}}
+ *
+ * Writes JSON to STDOUT:
+ *   {"ok":true,"output":"...","meta":{...}}
+ *
+ * Hardening notes:
+ * - Only allowlisted actions are supported.
+ * - Inputs are validated (length, charset, basenames only).
+ * - Health URL is restricted to loopback (prevents SSRF / internal scanning).
+ * - File reads are restricted to files that resolve under app root.
+ * - SQL execution is read-only and allowlisted (SELECT/SHOW/EXPLAIN/DESCRIBE only).
+ */
+
+ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
+const ENV_FILE = '/etc/symfony-diag.env';
+
+function respond(bool $ok, string $output, array $meta = []): void {
+  $payload = [
+    'ok' => $ok,
+    'output' => $output,
+    'meta' => (object)$meta,
+  ];
+  fwrite(STDOUT, json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n");
+  exit($ok ? 0 : 1);
+}
+
+function loadEnvFile(string $path): void {
+  if (!is_readable($path)) return;
+  $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+  if ($lines === false) return;
+
+  foreach ($lines as $line) {
+    $line = trim($line);
+    if ($line === '' || str_starts_with($line, '#')) continue;
+    $pos = strpos($line, '=');
+    if ($pos === false) continue;
+    $key = trim(substr($line, 0, $pos));
+    $val = trim(substr($line, $pos + 1));
+    // Strip optional surrounding quotes
+    if ((str_starts_with($val, '"') && str_ends_with($val, '"')) || (str_starts_with($val, "'") && str_ends_with($val, "'"))) {
+      $val = substr($val, 1, -1);
+    }
+    if ($key !== '' && getenv($key) === false) {
+      putenv($key . '=' . $val);
+    }
+  }
+}
+
+function envValue(string $key, ?string $default = null): ?string {
+  $v = getenv($key);
+  if ($v === false || $v === '') return $default;
+  return $v;
+}
+
+function requireEnv(string $key): string {
+  $v = envValue($key);
+  if ($v === null) respond(false, "Missing required config: {$key}");
+  return $v;
+}
+
+function truncate(string $s, int $maxChars): string {
+  if ($maxChars <= 0) return '';
+  if (mb_strlen($s) <= $maxChars) return $s;
+  return mb_substr($s, 0, $maxChars) . "\n\n…(truncated)…";
+}
+
+function redact(string $s): string {
+  // Best-effort redaction. This is NOT perfect.
+  $patterns = [
+    // Common framework secrets
+    '/APP_KEY\s*=\s*base64:[A-Za-z0-9+\/=]{20,}/' => 'APP_KEY=base64:[REDACTED]',
+    '/APP_KEY\s*=\s*[A-Za-z0-9+\/=]{20,}/' => 'APP_KEY=[REDACTED]',
+    '/APP_SECRET\s*=\s*[^\s]{16,}/' => 'APP_SECRET=[REDACTED]',
+
+    // Common env secrets / DSNs
+    '/\b(AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_SESSION_TOKEN)\s*=\s*[^\s]+/' => '$1=[REDACTED]',
+    '/\b(DATABASE_URL|REDIS_URL|MAIL_URL|MAILER_DSN|MESSENGER_TRANSPORT_DSN|SENTRY_DSN)\s*=\s*[^\s]+/' => '$1=[REDACTED]',
+
+    // Password-ish assignments
+    '/(password|passwd|pwd)\s*[:=]\s*["\']?[^"\'>\s]+["\']?/i' => '$1=[REDACTED]',
+
+    // Bearer tokens
+    '/Authorization:\s*Bearer\s+[A-Za-z0-9\-_\.=]{10,}/i' => 'Authorization: Bearer [REDACTED]',
+    '/Bearer\s+[A-Za-z0-9\-_\.=]{10,}/' => 'Bearer [REDACTED]',
+
+    // JWT-ish blobs
+    '/\beyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\b/' => '[REDACTED_JWT]',
+
+    // Long hex tokens
+    '/\b[a-f0-9]{32,}\b/i' => '[REDACTED_HEX]',
+  ];
+
+  foreach ($patterns as $re => $rep) {
+    $s = preg_replace($re, $rep, $s) ?? $s;
+  }
+  return $s;
+}
+
+function isSafeBasename(?string $name): bool {
+  if ($name === null) return true;
+  if ($name === '' || strlen($name) > 128) return false;
+  if (str_contains($name, '/') || str_contains($name, '\\')) return false;
+  if (str_contains($name, "\0")) return false;
+  // allow letters, numbers, dots, dashes, underscores
+  return (bool)preg_match('/^[A-Za-z0-9._-]+$/', $name);
+}
+
+function findLatestLogFile(string $logDir): ?string {
+  if (!is_dir($logDir)) return null;
+  $files = glob($logDir . DIRECTORY_SEPARATOR . '*.log*');
+  if (!$files) return null;
+
+  $best = null;
+  $bestMtime = -1;
+  foreach ($files as $f) {
+    if (!is_file($f)) continue;
+    $m = filemtime($f);
+    if ($m !== false && $m > $bestMtime) {
+      $bestMtime = $m;
+      $best = $f;
+    }
+  }
+  return $best;
+}
+
+function resolveLogFile(string $logDir, ?string $basename): ?string {
+  if (!is_dir($logDir)) return null;
+  if ($basename === null || $basename === '') {
+    return findLatestLogFile($logDir);
+  }
+  if (!isSafeBasename($basename)) return null;
+  $path = $logDir . DIRECTORY_SEPARATOR . $basename;
+  if (!is_file($path)) return null;
+  // Ensure it's under logDir (defense-in-depth)
+  $realDir = realpath($logDir);
+  $realFile = realpath($path);
+  if ($realDir === false || $realFile === false) return null;
+  if (!str_starts_with($realFile, $realDir . DIRECTORY_SEPARATOR)) return null;
+  return $realFile;
+}
+
+function resolveEnvFile(string $appDir, ?string $basename): ?string {
+  $target = $basename ?? '.env';
+  if (!isSafeBasename($target)) return null;
+
+  // Allow `.env` and `.env.*` but refuse PHP-dumped env file by default.
+  if (!preg_match('/^\.env(\.[A-Za-z0-9._-]+)?$/', $target)) return null;
+  if (str_ends_with($target, '.php')) return null;
+
+  $path = $appDir . DIRECTORY_SEPARATOR . $target;
+  if (!is_file($path)) return null;
+
+  $realDir = realpath($appDir);
+  $realFile = realpath($path);
+  if ($realDir === false || $realFile === false) return null;
+  if ($realFile !== $realDir . DIRECTORY_SEPARATOR . $target) return null;
+  if (!str_starts_with($realFile, $realDir . DIRECTORY_SEPARATOR)) return null;
+
+  return $realFile;
+}
+
+function normalizeProjectRelativePath(string $relativePath): ?string {
+  if ($relativePath === '' || strlen($relativePath) > 512) return null;
+  if (str_contains($relativePath, "\0")) return null;
+
+  $rel = trim(str_replace('\\', '/', $relativePath));
+  if ($rel === '') return null;
+  $rel = ltrim($rel, '/');
+  if ($rel === '') $rel = '.';
+
+  return $rel;
+}
+
+function resolveProjectPath(string $appDir, string $relativePath): ?string {
+  $base = realpath($appDir);
+  if ($base === false || !is_dir($base)) return null;
+
+  $rel = normalizeProjectRelativePath($relativePath);
+  if ($rel === null) return null;
+
+  $candidate = ($rel === '.') ? $base : ($base . DIRECTORY_SEPARATOR . $rel);
+  $resolved = realpath($candidate);
+  if ($resolved === false) return null;
+
+  if ($resolved !== $base && !str_starts_with($resolved, $base . DIRECTORY_SEPARATOR)) return null;
+  return $resolved;
+}
+
+function projectRelativePath(string $appDir, string $absolutePath): ?string {
+  $base = realpath($appDir);
+  if ($base === false) return null;
+
+  if ($absolutePath === $base) return '.';
+  if (!str_starts_with($absolutePath, $base . DIRECTORY_SEPARATOR)) return null;
+  return str_replace('\\', '/', substr($absolutePath, strlen($base) + 1));
+}
+
+function resolveProjectFile(string $appDir, string $relativePath): ?string {
+  $resolved = resolveProjectPath($appDir, $relativePath);
+  if ($resolved === null || !is_file($resolved)) return null;
+  return $resolved;
+}
+
+function isSafeConnectionName(?string $name): bool {
+  if ($name === null) return true;
+  if ($name === '' || strlen($name) > 64) return false;
+  return (bool)preg_match('/^[A-Za-z0-9._-]+$/', $name);
+}
+
+function normalizeReadOnlySql(string $query): ?string {
+  if (str_contains($query, "\0")) return null;
+
+  $trimmed = trim($query);
+  if ($trimmed === '' || strlen($trimmed) > 5000) return null;
+
+  // Allow at most one trailing ';' and reject multi-statement input.
+  $withoutTrailing = rtrim($trimmed);
+  if (str_ends_with($withoutTrailing, ';')) {
+    $withoutTrailing = rtrim(substr($withoutTrailing, 0, -1));
+  }
+  if ($withoutTrailing === '' || str_contains($withoutTrailing, ';')) return null;
+
+  if (!preg_match('/^\s*(SELECT|SHOW|EXPLAIN|DESCRIBE|DESC)\b/i', $withoutTrailing)) return null;
+
+  // Defense-in-depth for read-only query edge cases.
+  if (preg_match('/^\s*SELECT\b/i', $withoutTrailing)) {
+    if (preg_match('/\bINTO\s+OUTFILE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bINTO\s+DUMPFILE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bFOR\s+UPDATE\b/i', $withoutTrailing)) return null;
+    if (preg_match('/\bLOCK\s+IN\s+SHARE\s+MODE\b/i', $withoutTrailing)) return null;
+  }
+
+  return $withoutTrailing;
+}
+
+function encodeJsonPretty(array $payload): string {
+  $encoded = json_encode(
+    $payload,
+    JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PARTIAL_OUTPUT_ON_ERROR
+  );
+  if ($encoded === false) return 'Failed to encode output as JSON.';
+  return $encoded;
+}
+
+function isSafeLoopbackUrl(string $url): bool {
+  $parts = parse_url($url);
+  if ($parts === false) return false;
+  $scheme = $parts['scheme'] ?? '';
+  $host = $parts['host'] ?? '';
+  if ($scheme !== 'http' && $scheme !== 'https') return false;
+  if ($host === '127.0.0.1' || $host === 'localhost' || $host === '::1' || $host === '[::1]') return true;
+  return false;
+}
+
+function runCommand(string $cmd, int $timeoutSec, int $maxOut): array {
+  // Use proc_open so we can enforce timeout and capture stderr.
+  $descriptorspec = [
+    0 => ['pipe', 'r'],
+    1 => ['pipe', 'w'],
+    2 => ['pipe', 'w'],
+  ];
+  $process = proc_open($cmd, $descriptorspec, $pipes);
+  if (!is_resource($process)) {
+    return ['ok' => false, 'stdout' => '', 'stderr' => 'Failed to start process'];
+  }
+
+  fclose($pipes[0]);
+  stream_set_blocking($pipes[1], false);
+  stream_set_blocking($pipes[2], false);
+
+  $stdout = '';
+  $stderr = '';
+  $start = microtime(true);
+
+  while (true) {
+    $status = proc_get_status($process);
+    $stdout .= stream_get_contents($pipes[1]) ?: '';
+    $stderr .= stream_get_contents($pipes[2]) ?: '';
+
+    if (strlen($stdout) > $maxOut * 2 || strlen($stderr) > $maxOut * 2) {
+      proc_terminate($process, 9);
+      break;
+    }
+
+    if (!$status['running']) break;
+
+    if ((microtime(true) - $start) > $timeoutSec) {
+      proc_terminate($process, 9);
+      $stderr .= "\n[timeout] exceeded {$timeoutSec}s";
+      break;
+    }
+    usleep(50_000);
+  }
+
+  $stdout .= stream_get_contents($pipes[1]) ?: '';
+  $stderr .= stream_get_contents($pipes[2]) ?: '';
+
+  fclose($pipes[1]);
+  fclose($pipes[2]);
+
+  $exitCode = proc_close($process);
+
+  $ok = ($exitCode === 0);
+  return ['ok' => $ok, 'stdout' => $stdout, 'stderr' => $stderr, 'exitCode' => $exitCode];
+}
+
+function bootstrapSymfonyDoctrine(string $appDir): array {
+  static $cache = [];
+  if (isset($cache[$appDir])) return $cache[$appDir];
+
+  $autoload = $appDir . DIRECTORY_SEPARATOR . 'vendor' . DIRECTORY_SEPARATOR . 'autoload.php';
+  if (!is_file($autoload)) {
+    return $cache[$appDir] = ['ok' => false, 'error' => "Missing autoload file: {$autoload}"];
+  }
+
+  try {
+    require_once $autoload;
+
+    $kernelClass = envValue('SYMFONY_DIAG_KERNEL_CLASS', 'App\\Kernel') ?? 'App\\Kernel';
+    $appEnv = envValue('SYMFONY_DIAG_APP_ENV', 'prod') ?? 'prod';
+    $debugVal = strtolower(envValue('SYMFONY_DIAG_APP_DEBUG', '0') ?? '0');
+    $appDebug = in_array($debugVal, ['1', 'true', 'yes', 'on'], true);
+
+    if (!class_exists($kernelClass)) {
+      // Common Symfony skeleton location.
+      $kernelFile = $appDir . DIRECTORY_SEPARATOR . 'src' . DIRECTORY_SEPARATOR . 'Kernel.php';
+      if (is_file($kernelFile)) {
+        require_once $kernelFile;
+      }
+    }
+
+    if (!class_exists($kernelClass)) {
+      return $cache[$appDir] = ['ok' => false, 'error' => "Kernel class not found: {$kernelClass}. Set SYMFONY_DIAG_KERNEL_CLASS."];
+    }
+
+    $kernel = new $kernelClass($appEnv, $appDebug);
+    if (!is_object($kernel) || !method_exists($kernel, 'boot') || !method_exists($kernel, 'getContainer')) {
+      return $cache[$appDir] = ['ok' => false, 'error' => 'Failed to bootstrap Symfony kernel (unexpected Kernel API).'];
+    }
+
+    $kernel->boot();
+    $container = $kernel->getContainer();
+    if (!is_object($container)) {
+      return $cache[$appDir] = ['ok' => false, 'error' => 'Symfony container unavailable after boot().'];
+    }
+
+    $hasDoctrine = false;
+    if (method_exists($container, 'has')) {
+      $hasDoctrine = (bool)$container->has('doctrine');
+    } else {
+      // Fallback: try get() and catch.
+      $hasDoctrine = true;
+    }
+
+    if (!$hasDoctrine) {
+      return $cache[$appDir] = ['ok' => false, 'error' => 'Doctrine service not found in container. Is doctrine/doctrine-bundle installed?'];
+    }
+
+    $doctrine = $container->get('doctrine');
+    if (!is_object($doctrine)) {
+      return $cache[$appDir] = ['ok' => false, 'error' => 'Doctrine service is not an object.'];
+    }
+
+    return $cache[$appDir] = [
+      'ok' => true,
+      'kernel' => $kernel,
+      'container' => $container,
+      'doctrine' => $doctrine,
+      'env' => $appEnv,
+      'debug' => $appDebug,
+      'kernelClass' => $kernelClass,
+    ];
+  } catch (Throwable $e) {
+    return $cache[$appDir] = ['ok' => false, 'error' => $e->getMessage()];
+  }
+}
+
+function doctrineConnectionNames(object $doctrine): array {
+  if (method_exists($doctrine, 'getConnectionNames')) {
+    $names = $doctrine->getConnectionNames();
+    if (is_array($names)) return array_keys($names);
+  }
+  if (method_exists($doctrine, 'getConnections')) {
+    $conns = $doctrine->getConnections();
+    if (is_array($conns)) return array_keys($conns);
+  }
+  // Fallback: try common default
+  return ['default'];
+}
+
+function doctrineDefaultConnectionName(object $doctrine, array $names): string {
+  if (method_exists($doctrine, 'getDefaultConnectionName')) {
+    $v = $doctrine->getDefaultConnectionName();
+    if (is_string($v) && $v !== '') return $v;
+  }
+  // Common fallback
+  if (in_array('default', $names, true)) return 'default';
+  return $names[0] ?? 'default';
+}
+
+function doctrineGetConnection(object $doctrine, string $name): object {
+  if (method_exists($doctrine, 'getConnection')) {
+    return $doctrine->getConnection($name);
+  }
+  // Fallback: try connections array
+  if (method_exists($doctrine, 'getConnections')) {
+    $conns = $doctrine->getConnections();
+    if (is_array($conns) && isset($conns[$name]) && is_object($conns[$name])) return $conns[$name];
+  }
+  throw new RuntimeException("Doctrine connection not found: {$name}");
+}
+
+function doctrineDriverName(object $conn): ?string {
+  if (method_exists($conn, 'getParams')) {
+    $params = $conn->getParams();
+    if (is_array($params)) {
+      if (isset($params['driver']) && is_string($params['driver'])) return $params['driver'];
+      if (isset($params['driverClass']) && is_string($params['driverClass'])) return $params['driverClass'];
+    }
+  }
+  if (method_exists($conn, 'getDriver')) {
+    $driver = $conn->getDriver();
+    if (is_object($driver) && method_exists($driver, 'getName')) {
+      $n = $driver->getName();
+      if (is_string($n)) return $n;
+    }
+  }
+  if (method_exists($conn, 'getDatabasePlatform')) {
+    $plat = $conn->getDatabasePlatform();
+    if (is_object($plat) && method_exists($plat, 'getName')) {
+      $n = $plat->getName();
+      if (is_string($n)) return $n;
+    }
+  }
+  return null;
+}
+
+function doctrineSchemaManager(object $conn): object {
+  if (method_exists($conn, 'createSchemaManager')) {
+    return $conn->createSchemaManager();
+  }
+  if (method_exists($conn, 'getSchemaManager')) {
+    return $conn->getSchemaManager();
+  }
+  throw new RuntimeException('Doctrine DBAL schema manager not available.');
+}
+
+function schemaListTableNames(object $sm): array {
+  if (method_exists($sm, 'listTableNames')) {
+    $names = $sm->listTableNames();
+    return is_array($names) ? $names : [];
+  }
+  if (method_exists($sm, 'listTables')) {
+    $tables = $sm->listTables();
+    if (!is_array($tables)) return [];
+    $out = [];
+    foreach ($tables as $t) {
+      if (is_object($t) && method_exists($t, 'getName')) {
+        $out[] = (string)$t->getName();
+      } elseif (is_string($t)) {
+        $out[] = $t;
+      }
+    }
+    return $out;
+  }
+  return [];
+}
+
+function columnToArray(object $col): array {
+  $name = method_exists($col, 'getName') ? (string)$col->getName() : null;
+
+  $type = null;
+  if (method_exists($col, 'getType')) {
+    $t = $col->getType();
+    if (is_object($t) && method_exists($t, 'getName')) {
+      $type = (string)$t->getName();
+    } elseif (is_string($t)) {
+      $type = $t;
+    }
+  }
+
+  $out = [
+    'name' => $name,
+    'type' => $type,
+  ];
+
+  $map = [
+    'length' => 'getLength',
+    'precision' => 'getPrecision',
+    'scale' => 'getScale',
+    'unsigned' => 'getUnsigned',
+    'fixed' => 'getFixed',
+    'notnull' => 'getNotnull',
+    'default' => 'getDefault',
+    'autoincrement' => 'getAutoincrement',
+    'comment' => 'getComment',
+  ];
+  foreach ($map as $k => $m) {
+    if (method_exists($col, $m)) {
+      $out[$k] = $col->$m();
+    }
+  }
+
+  return $out;
+}
+
+function indexToArray(object $idx): array {
+  $name = method_exists($idx, 'getName') ? (string)$idx->getName() : null;
+  $cols = method_exists($idx, 'getColumns') ? $idx->getColumns() : null;
+  if (!is_array($cols)) $cols = [];
+
+  $out = [
+    'name' => $name,
+    'columns' => array_values(array_map('strval', $cols)),
+  ];
+
+  if (method_exists($idx, 'isUnique')) $out['unique'] = (bool)$idx->isUnique();
+  if (method_exists($idx, 'isPrimary')) $out['primary'] = (bool)$idx->isPrimary();
+  return $out;
+}
+
+function foreignKeyToArray(object $fk): array {
+  $out = [];
+  if (method_exists($fk, 'getName')) $out['name'] = $fk->getName();
+  if (method_exists($fk, 'getLocalColumns')) $out['localColumns'] = $fk->getLocalColumns();
+  if (method_exists($fk, 'getForeignTableName')) $out['foreignTable'] = $fk->getForeignTableName();
+  if (method_exists($fk, 'getForeignColumns')) $out['foreignColumns'] = $fk->getForeignColumns();
+  if (method_exists($fk, 'onUpdate')) $out['onUpdate'] = $fk->onUpdate();
+  if (method_exists($fk, 'onDelete')) $out['onDelete'] = $fk->onDelete();
+  return $out;
+}
+
+function safeCliName(?string $name): bool {
+  if ($name === null) return true;
+  if ($name === '' || strlen($name) > 64) return false;
+  // No leading '-' to prevent injecting options.
+  if (str_starts_with($name, '-')) return false;
+  return (bool)preg_match('/^[A-Za-z0-9._-]+$/', $name);
+}
+
+// ---- Main ----
+
+loadEnvFile(ENV_FILE);
+
+$raw = stream_get_contents(STDIN);
+if ($raw === false || trim($raw) === '') {
+  respond(false, 'No input received. Expected JSON on STDIN.');
+}
+
+$data = json_decode($raw, true);
+if (!is_array($data)) {
+  respond(false, 'Invalid JSON input.');
+}
+
+$action = $data['action'] ?? ($data['cmd'] ?? null);
+$params = $data['params'] ?? [];
+if (!is_string($action) || $action === '') {
+  respond(false, 'Missing action/cmd.');
+}
+if (!is_array($params)) $params = [];
+
+// Backward compatibility: accept MCP tool-style names like "sys_info".
+if (!str_contains($action, '.') && str_contains($action, '_')) {
+  $parts = explode('_', $action, 2);
+  if (count($parts) === 2 && $parts[0] !== '' && $parts[1] !== '') {
+    $action = $parts[0] . '.' . $parts[1];
+  }
+}
+
+$maxOutput = (int)(envValue('SYMFONY_DIAG_MAX_OUTPUT_CHARS', '200000') ?? '200000');
+if ($maxOutput < 10000) $maxOutput = 10000;
+
+$timeoutSec = (int)(envValue('SYMFONY_DIAG_TIMEOUT_SEC', '25') ?? '25');
+if ($timeoutSec < 5) $timeoutSec = 5;
+if ($timeoutSec > 120) $timeoutSec = 120;
+
+$appDir = requireEnv('SYMFONY_DIAG_APP_DIR');
+if (!is_dir($appDir)) respond(false, "Invalid app dir: {$appDir}");
+
+$logDir = envValue('SYMFONY_DIAG_LOG_DIR', $appDir . '/var/log') ?? ($appDir . '/var/log');
+$healthUrl = envValue('SYMFONY_DIAG_HEALTH_URL', 'http://127.0.0.1/health') ?? 'http://127.0.0.1/health';
+$phpBin = envValue('SYMFONY_DIAG_PHP_BIN', 'php') ?? 'php';
+$console = envValue('SYMFONY_DIAG_CONSOLE', $appDir . '/bin/console') ?? ($appDir . '/bin/console');
+
+$kernelClass = envValue('SYMFONY_DIAG_KERNEL_CLASS', 'App\\Kernel') ?? 'App\\Kernel';
+$appEnv = envValue('SYMFONY_DIAG_APP_ENV', 'prod') ?? 'prod';
+$debugVal = strtolower(envValue('SYMFONY_DIAG_APP_DEBUG', '0') ?? '0');
+$appDebug = in_array($debugVal, ['1', 'true', 'yes', 'on'], true);
+
+$enableMutations = strtolower(envValue('SYMFONY_DIAG_ENABLE_MUTATIONS', '0') ?? '0');
+$enableMutations = in_array($enableMutations, ['1', 'true', 'yes', 'on'], true);
+
+$meta = [
+  'action' => $action,
+  'host' => php_uname('n'),
+];
+
+$out = '';
+$ok = true;
+
+switch ($action) {
+  case 'health': {
+    $url = $params['url'] ?? $healthUrl;
+    if (!is_string($url) || !isSafeLoopbackUrl($url)) {
+      respond(false, 'Refused: health url must be loopback (127.0.0.1/localhost/::1).', $meta);
+    }
+    // Prefer curl if available.
+    $cmd = "command -v curl >/dev/null 2>&1 && curl -fsS -o /dev/null -m 10 -w '%{http_code}' " . escapeshellarg($url);
+    $res = runCommand('sh -lc ' . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+    $code = trim((string)($res['stdout'] ?? ''));
+    if (($res['ok'] ?? false) && $code === '200') {
+      $out = "OK (HTTP 200) - {$url}";
+      $ok = true;
+    } else {
+      $out = "FAIL (HTTP {$code}) - {$url}\n" . trim((string)($res['stderr'] ?? ''));
+      $ok = false;
+    }
+    break;
+  }
+
+  case 'sys.info': {
+    $cmd = 'sh -lc ' . escapeshellarg('uname -a; echo; date -Is; echo; uptime; echo; whoami');
+    $res = runCommand($cmd, $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'sys.disk': {
+    $res = runCommand('sh -lc ' . escapeshellarg('df -h'), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'sys.memory': {
+    $cmd = 'sh -lc ' . escapeshellarg("command -v free >/dev/null 2>&1 && free -m || (cat /proc/meminfo 2>/dev/null | head -n 30) || echo 'free and /proc/meminfo unavailable'");
+    $res = runCommand($cmd, $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'sys.top': {
+    $cmd = 'sh -lc ' . escapeshellarg('ps aux --sort=-%cpu | head -n 20; echo; ps aux --sort=-%mem | head -n 20');
+    $res = runCommand($cmd, $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['exitCode'] = $res['exitCode'] ?? null;
+    break;
+  }
+
+  case 'php.version': {
+    $res = runCommand('sh -lc ' . escapeshellarg($phpBin . ' -v'), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'php.extensions': {
+    $res = runCommand('sh -lc ' . escapeshellarg($phpBin . ' -m'), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'cache.status': {
+    $cacheDir = $appDir . '/var/cache';
+    if (!is_dir($cacheDir)) {
+      $out = 'No var/cache directory found.';
+      $ok = true;
+      break;
+    }
+
+    $lines = [];
+    $lines[] = 'var/cache:';
+
+    $entries = scandir($cacheDir);
+    if ($entries === false) $entries = [];
+
+    foreach ($entries as $name) {
+      if ($name === '.' || $name === '..') continue;
+      $path = $cacheDir . DIRECTORY_SEPARATOR . $name;
+      if (!is_dir($path)) continue;
+
+      $mtime = filemtime($path);
+      $lines[] = sprintf('- %s/ (mtime: %s)', $name, $mtime ? date('c', $mtime) : '?');
+
+      // Common container file hint
+      $containers = glob($path . DIRECTORY_SEPARATOR . '*Container.php') ?: [];
+      if (count($containers) > 0 && is_file($containers[0])) {
+        $f = $containers[0];
+        $bn = basename($f);
+        $sz = filesize($f);
+        $fm = filemtime($f);
+        $lines[] = sprintf('  - %s (%s bytes, mtime: %s)', $bn, $sz === false ? '?' : (string)$sz, $fm ? date('c', $fm) : '?');
+      }
+    }
+
+    if (count($lines) === 1) $lines[] = '- (no cache directories)';
+    $out = implode("\n", $lines);
+    $ok = true;
+    break;
+  }
+
+  case 'database.connections': {
+    $boot = bootstrapSymfonyDoctrine($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, 'Failed to bootstrap Symfony for database access: ' . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $doctrine = $boot['doctrine'];
+    if (!is_object($doctrine)) respond(false, 'Doctrine service is not available.', $meta);
+
+    $names = doctrineConnectionNames($doctrine);
+    $names = array_values(array_filter($names, fn($n) => is_string($n) && $n !== ''));
+    sort($names, SORT_NATURAL | SORT_FLAG_CASE);
+
+    $default = doctrineDefaultConnectionName($doctrine, $names);
+
+    $connections = [];
+    foreach ($names as $name) {
+      try {
+        $conn = doctrineGetConnection($doctrine, (string)$name);
+        $driver = is_object($conn) ? doctrineDriverName($conn) : null;
+      } catch (Throwable $e) {
+        $driver = null;
+      }
+      $connections[] = [
+        'name' => $name,
+        'driver' => $driver,
+        'isDefault' => ($name === $default),
+      ];
+    }
+
+    $out = encodeJsonPretty([
+      'default' => $default,
+      'count' => count($connections),
+      'connections' => $connections,
+      'kernelClass' => $boot['kernelClass'] ?? null,
+      'appEnv' => $boot['env'] ?? null,
+    ]);
+    $ok = true;
+    break;
+  }
+
+  case 'database.schema': {
+    $database = $params['database'] ?? null;
+    $filter = $params['filter'] ?? null;
+    $maxTables = $params['maxTables'] ?? 30;
+
+    if ($database !== null && !is_string($database)) respond(false, 'Invalid database param.', $meta);
+    if (!isSafeConnectionName($database)) respond(false, 'Invalid database connection name.', $meta);
+    if ($filter !== null && !is_string($filter)) respond(false, 'Invalid filter param.', $meta);
+    if ($filter !== null && strlen($filter) > 120) respond(false, 'Filter is too long.', $meta);
+    if (!is_int($maxTables)) $maxTables = (int)$maxTables;
+    if ($maxTables < 1 || $maxTables > 100) respond(false, 'Invalid maxTables.', $meta);
+
+    $boot = bootstrapSymfonyDoctrine($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, 'Failed to bootstrap Symfony for database access: ' . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $doctrine = $boot['doctrine'];
+    if (!is_object($doctrine)) respond(false, 'Doctrine service is not available.', $meta);
+
+    $names = doctrineConnectionNames($doctrine);
+    $default = doctrineDefaultConnectionName($doctrine, $names);
+    $connectionName = ($database === null || trim($database) === '') ? $default : $database;
+    if (!is_string($connectionName) || $connectionName === '') respond(false, 'No database connection resolved.', $meta);
+
+    try {
+      $conn = doctrineGetConnection($doctrine, $connectionName);
+      $driver = doctrineDriverName($conn) ?? 'unknown';
+      $sm = doctrineSchemaManager($conn);
+      $tableNames = schemaListTableNames($sm);
+      $tableNames = array_values(array_filter($tableNames, fn($t) => is_string($t) && $t !== ''));
+
+      $needle = ($filter !== null && trim($filter) !== '') ? mb_strtolower(trim($filter)) : null;
+      $matched = [];
+      foreach ($tableNames as $t) {
+        if ($needle !== null && !str_contains(mb_strtolower($t), $needle)) continue;
+        $matched[] = $t;
+      }
+      sort($matched, SORT_NATURAL | SORT_FLAG_CASE);
+
+      $totalMatched = count($matched);
+      $selected = array_slice($matched, 0, $maxTables);
+
+      $tables = [];
+      foreach ($selected as $tableName) {
+        $colsRaw = method_exists($sm, 'listTableColumns') ? $sm->listTableColumns($tableName) : [];
+        if (!is_array($colsRaw)) $colsRaw = [];
+        $cols = [];
+        foreach ($colsRaw as $c) {
+          if (is_object($c)) $cols[] = columnToArray($c);
+        }
+
+        $idxRaw = method_exists($sm, 'listTableIndexes') ? $sm->listTableIndexes($tableName) : [];
+        if (!is_array($idxRaw)) $idxRaw = [];
+        $indexes = [];
+        foreach ($idxRaw as $i) {
+          if (is_object($i)) $indexes[] = indexToArray($i);
+        }
+
+        $fkRaw = method_exists($sm, 'listTableForeignKeys') ? $sm->listTableForeignKeys($tableName) : [];
+        if (!is_array($fkRaw)) $fkRaw = [];
+        $foreignKeys = [];
+        foreach ($fkRaw as $fk) {
+          if (is_object($fk)) $foreignKeys[] = foreignKeyToArray($fk);
+        }
+
+        $tables[] = [
+          'name' => $tableName,
+          'columns' => $cols,
+          'indexes' => $indexes,
+          'foreignKeys' => $foreignKeys,
+        ];
+      }
+
+      $out = encodeJsonPretty([
+        'database' => $connectionName,
+        'driver' => $driver,
+        'filter' => $filter,
+        'totalMatchedTables' => $totalMatched,
+        'returnedTables' => count($tables),
+        'truncated' => ($totalMatched > count($tables)),
+        'tables' => $tables,
+      ]);
+      $ok = true;
+      $meta['database'] = $connectionName;
+      break;
+    } catch (Throwable $e) {
+      respond(false, 'Database schema introspection failed: ' . $e->getMessage(), $meta);
+    }
+  }
+
+  case 'database.query': {
+    $query = $params['query'] ?? null;
+    $database = $params['database'] ?? null;
+    $maxRows = $params['maxRows'] ?? 200;
+
+    if (!is_string($query) || trim($query) === '') respond(false, 'Invalid query.', $meta);
+    if ($database !== null && !is_string($database)) respond(false, 'Invalid database param.', $meta);
+    if (!isSafeConnectionName($database)) respond(false, 'Invalid database connection name.', $meta);
+    if (!is_int($maxRows)) $maxRows = (int)$maxRows;
+    if ($maxRows < 1 || $maxRows > 1000) respond(false, 'Invalid maxRows.', $meta);
+
+    $sql = normalizeReadOnlySql($query);
+    if ($sql === null) {
+      respond(false, 'Only single-statement read-only SQL is allowed (SELECT/SHOW/EXPLAIN/DESCRIBE).', $meta);
+    }
+
+    $boot = bootstrapSymfonyDoctrine($appDir);
+    if (!($boot['ok'] ?? false)) {
+      respond(false, 'Failed to bootstrap Symfony for database access: ' . ($boot['error'] ?? 'unknown error'), $meta);
+    }
+
+    $doctrine = $boot['doctrine'];
+    if (!is_object($doctrine)) respond(false, 'Doctrine service is not available.', $meta);
+
+    $names = doctrineConnectionNames($doctrine);
+    $default = doctrineDefaultConnectionName($doctrine, $names);
+    $connectionName = ($database === null || trim($database) === '') ? $default : $database;
+    if (!is_string($connectionName) || $connectionName === '') respond(false, 'No database connection resolved.', $meta);
+
+    try {
+      $conn = doctrineGetConnection($doctrine, $connectionName);
+      $driver = doctrineDriverName($conn) ?? 'unknown';
+
+      $stmt = null;
+      if (method_exists($conn, 'executeQuery')) {
+        $stmt = $conn->executeQuery($sql);
+      } elseif (method_exists($conn, 'query')) {
+        $stmt = $conn->query($sql);
+      }
+      if (!is_object($stmt)) {
+        respond(false, 'Failed to execute query (no statement/result object).', $meta);
+      }
+
+      $rows = [];
+      $count = 0;
+      $truncated = false;
+
+      $fetchOne = function () use ($stmt) {
+        if (method_exists($stmt, 'fetchAssociative')) {
+          $r = $stmt->fetchAssociative();
+          return is_array($r) ? $r : false;
+        }
+        if (method_exists($stmt, 'fetch')) {
+          $r = $stmt->fetch(PDO::FETCH_ASSOC);
+          return is_array($r) ? $r : false;
+        }
+        return false;
+      };
+
+      while ($count < $maxRows) {
+        $row = $fetchOne();
+        if ($row === false) break;
+        $rows[] = $row;
+        $count++;
+      }
+
+      // Peek one more row to detect truncation.
+      $extra = $fetchOne();
+      if ($extra !== false) {
+        $truncated = true;
+      }
+
+      $out = encodeJsonPretty([
+        'database' => $connectionName,
+        'driver' => $driver,
+        'query' => $sql,
+        'returnedRows' => count($rows),
+        'truncated' => $truncated,
+        'rows' => $rows,
+      ]);
+      $ok = true;
+      $meta['database'] = $connectionName;
+      break;
+    } catch (Throwable $e) {
+      respond(false, 'Database query failed: ' . $e->getMessage(), $meta);
+    }
+  }
+
+  case 'env.read': {
+    $file = $params['file'] ?? '.env';
+    if (!is_string($file) || trim($file) === '' || strlen($file) > 64) {
+      respond(false, 'Invalid env file param.', $meta);
+    }
+
+    $path = resolveEnvFile($appDir, $file);
+    if ($path === null) {
+      respond(false, 'Env file not found (or refused). Allowed: `.env` / `.env.*` under app root (excluding `.php`).', $meta);
+    }
+
+    $content = file_get_contents($path);
+    if ($content === false) respond(false, 'Failed to read env file.', $meta);
+
+    $out = $content;
+    $ok = true;
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'file.list': {
+    $path = $params['path'] ?? '.';
+    $recursive = $params['recursive'] ?? false;
+    $maxEntries = $params['maxEntries'] ?? 300;
+
+    if (!is_string($path) || trim($path) === '') respond(false, 'Invalid path param.', $meta);
+    if (!is_bool($recursive)) $recursive = (bool)$recursive;
+    if (!is_int($maxEntries)) $maxEntries = (int)$maxEntries;
+    if ($maxEntries < 1 || $maxEntries > 1000) respond(false, 'Invalid maxEntries.', $meta);
+
+    $resolved = resolveProjectPath($appDir, $path);
+    if ($resolved === null) {
+      respond(false, 'Path not found (or refused). Path must resolve under app root.', $meta);
+    }
+
+    $base = realpath($appDir);
+    if ($base === false) respond(false, 'Invalid app dir.', $meta);
+
+    $resolvedRel = projectRelativePath($appDir, $resolved) ?? '.';
+
+    $lines = [];
+    $lines[] = "Path: {$resolvedRel}";
+    $lines[] = 'Type: ' . (is_dir($resolved) ? 'directory' : 'file');
+
+    $count = 0;
+
+    if (is_file($resolved)) {
+      $size = filesize($resolved);
+      $mtime = filemtime($resolved);
+      $lines[] = sprintf(
+        '[F] %s (%s bytes, mtime: %s)',
+        $resolvedRel,
+        $size === false ? '?' : (string)$size,
+        $mtime ? date('c', $mtime) : '?'
+      );
+      $count = 1;
+    } elseif (is_dir($resolved)) {
+      if ($recursive) {
+        $dirIt = new RecursiveDirectoryIterator($resolved, FilesystemIterator::SKIP_DOTS);
+        $it = new RecursiveIteratorIterator($dirIt, RecursiveIteratorIterator::SELF_FIRST);
+
+        foreach ($it as $entry) {
+          $entryPath = $entry->getPathname();
+          $realEntry = realpath($entryPath);
+          if ($realEntry === false) continue;
+          if (!str_starts_with($realEntry, $base . DIRECTORY_SEPARATOR)) continue;
+
+          $rel = projectRelativePath($appDir, $realEntry);
+          if ($rel === null) continue;
+
+          $isDir = $entry->isDir();
+          $lines[] = ($isDir ? '[D] ' : '[F] ') . $rel . ($isDir ? '/' : '');
+          $count++;
+          if ($count >= $maxEntries) break;
+        }
+      } else {
+        $children = scandir($resolved);
+        if ($children === false) $children = [];
+
+        foreach ($children as $name) {
+          if ($name === '.' || $name === '..') continue;
+          $realChild = realpath($resolved . DIRECTORY_SEPARATOR . $name);
+          if ($realChild === false) continue;
+          if (!str_starts_with($realChild, $base . DIRECTORY_SEPARATOR)) continue;
+
+          $rel = projectRelativePath($appDir, $realChild);
+          if ($rel === null) continue;
+
+          $isDir = is_dir($realChild);
+          $lines[] = ($isDir ? '[D] ' : '[F] ') . $rel . ($isDir ? '/' : '');
+          $count++;
+          if ($count >= $maxEntries) break;
+        }
+      }
+    } else {
+      respond(false, 'Path is not a regular file or directory.', $meta);
+    }
+
+    if ($count === 0 && is_dir($resolved)) {
+      $lines[] = '(empty directory)';
+    } elseif ($count >= $maxEntries) {
+      $lines[] = "...(truncated at {$maxEntries} entries)";
+    }
+
+    $out = implode("\n", $lines);
+    $ok = true;
+    $meta['path'] = $path;
+    $meta['resolved'] = $resolvedRel;
+    break;
+  }
+
+  case 'file.read': {
+    $path = $params['path'] ?? null;
+    if (!is_string($path) || trim($path) === '') {
+      respond(false, 'Invalid path param.', $meta);
+    }
+
+    $resolved = resolveProjectFile($appDir, $path);
+    if ($resolved === null) {
+      respond(false, 'File not found (or refused). Path must resolve under app root.', $meta);
+    }
+
+    $content = file_get_contents($resolved);
+    if ($content === false) respond(false, 'Failed to read file.', $meta);
+
+    $out = $content;
+    $ok = true;
+    $meta['file'] = $path;
+    break;
+  }
+
+  case 'logs.list': {
+    if (!is_dir($logDir)) respond(false, "Log dir not found: {$logDir}", $meta);
+    $files = glob($logDir . DIRECTORY_SEPARATOR . '*.log*') ?: [];
+    usort($files, function ($a, $b) {
+      return (filemtime($b) ?: 0) <=> (filemtime($a) ?: 0);
+    });
+
+    $lines = [];
+    $lines[] = "Logs in: {$logDir}";
+    $limit = 30;
+    $i = 0;
+    foreach ($files as $f) {
+      if (!is_file($f)) continue;
+      $bn = basename($f);
+      $size = filesize($f);
+      $mtime = filemtime($f);
+      $lines[] = sprintf('- %s  (%s bytes, mtime: %s)', $bn, $size === false ? '?' : (string)$size, $mtime ? date('c', $mtime) : '?');
+      $i++;
+      if ($i >= $limit) break;
+    }
+    if ($i === 0) $lines[] = '- (no *.log files found)';
+    $out = implode("\n", $lines);
+    $ok = true;
+    break;
+  }
+
+  case 'logs.tail': {
+    $file = $params['file'] ?? null;
+    $lines = $params['lines'] ?? 200;
+    if (!is_int($lines)) $lines = (int)$lines;
+    if ($lines < 10 || $lines > 2000) respond(false, "Invalid lines: {$lines}", $meta);
+
+    if ($file !== null && !is_string($file)) respond(false, 'Invalid file param.', $meta);
+    if (!isSafeBasename($file)) respond(false, 'Invalid file basename.', $meta);
+
+    $path = resolveLogFile($logDir, $file);
+    if ($path === null) respond(false, 'Log file not found (or refused). Use logs.list to see available files.', $meta);
+
+    $cmd = 'tail -n ' . (int)$lines . ' ' . escapeshellarg($path);
+    $res = runCommand('sh -lc ' . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'logs.grep': {
+    $file = $params['file'] ?? null;
+    $query = $params['query'] ?? '';
+    $maxMatches = $params['maxMatches'] ?? 200;
+    $ignoreCase = $params['ignoreCase'] ?? false;
+
+    if (!is_string($query) || trim($query) === '' || strlen($query) > 120) respond(false, 'Invalid query.', $meta);
+    if (!is_int($maxMatches)) $maxMatches = (int)$maxMatches;
+    if ($maxMatches < 10 || $maxMatches > 500) respond(false, 'Invalid maxMatches.', $meta);
+    if (!is_bool($ignoreCase)) $ignoreCase = (bool)$ignoreCase;
+
+    if ($file !== null && !is_string($file)) respond(false, 'Invalid file param.', $meta);
+    if (!isSafeBasename($file)) respond(false, 'Invalid file basename.', $meta);
+
+    $path = resolveLogFile($logDir, $file);
+    if ($path === null) respond(false, 'Log file not found (or refused). Use logs.list to see available files.', $meta);
+
+    $grepFlags = '-nF';
+    if ($ignoreCase) $grepFlags .= 'i';
+    // Use fixed string match (-F). Pipe into tail to cap output.
+    $cmd = "grep {$grepFlags} -- " . escapeshellarg($query) . ' ' . escapeshellarg($path) . ' | tail -n ' . (int)$maxMatches;
+    $res = runCommand('sh -lc ' . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+
+    // grep returns exit code 1 when no matches. Treat that as ok.
+    $exitCode = $res['exitCode'] ?? 0;
+    $stdout = (string)($res['stdout'] ?? '');
+    $stderr = (string)($res['stderr'] ?? '');
+    if ($exitCode === 1 && trim($stdout) === '') {
+      $out = "(no matches)\n";
+      $ok = true;
+    } else {
+      $out = trim($stdout . "\n" . $stderr);
+      $ok = ($exitCode === 0);
+    }
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  case 'logs.last_error': {
+    $file = $params['file'] ?? null;
+    $lines = $params['lines'] ?? 800;
+    if (!is_int($lines)) $lines = (int)$lines;
+    if ($lines < 50 || $lines > 5000) respond(false, 'Invalid lines.', $meta);
+
+    if ($file !== null && !is_string($file)) respond(false, 'Invalid file param.', $meta);
+    if (!isSafeBasename($file)) respond(false, 'Invalid file basename.', $meta);
+
+    $path = resolveLogFile($logDir, $file);
+    if ($path === null) respond(false, 'Log file not found (or refused). Use logs.list to see available files.', $meta);
+
+    // Tail a chunk and filter for common error markers.
+    $cmd = 'tail -n ' . (int)$lines . ' ' . escapeshellarg($path) . " | grep -nE -- 'ERROR|CRITICAL|EMERGENCY|Exception|Stack trace|SQLSTATE' | tail -n 200";
+    $res = runCommand('sh -lc ' . escapeshellarg($cmd), $timeoutSec, $maxOutput);
+
+    $exitCode = $res['exitCode'] ?? 0;
+    $stdout = (string)($res['stdout'] ?? '');
+    $stderr = (string)($res['stderr'] ?? '');
+
+    if ($exitCode === 1 && trim($stdout) === '') {
+      $out = "(no obvious error markers found in last {$lines} lines)\n";
+      $ok = true;
+    } else {
+      $out = trim($stdout . "\n" . $stderr);
+      $ok = ($exitCode === 0);
+    }
+    $meta['file'] = basename($path);
+    break;
+  }
+
+  // ---- Symfony console (fixed, allowlisted) ----
+  case 'console.version': {
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' --version --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.about': {
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' about --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.debug_router': {
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' debug:router --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.doctrine_migrations_status': {
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' doctrine:migrations:status --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.doctrine_schema_validate': {
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' doctrine:schema:validate --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.messenger_failed': {
+    $transport = $params['transport'] ?? null;
+    if ($transport !== null && !is_string($transport)) respond(false, 'Invalid transport param.', $meta);
+    if (!safeCliName($transport)) respond(false, 'Invalid transport name.', $meta);
+
+    $transportOpt = ($transport !== null && trim($transport) !== '') ? (' --transport=' . escapeshellarg($transport)) : '';
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' messenger:failed:show --stats' . $transportOpt . ' --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  // ---- Mutations (break-glass; gated) ----
+  case 'console.cache_clear': {
+    if (!$enableMutations) respond(false, 'Refused: mutations disabled on remote. Set SYMFONY_DIAG_ENABLE_MUTATIONS=1.', $meta);
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' cache:clear --no-warmup --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.cache_warmup': {
+    if (!$enableMutations) respond(false, 'Refused: mutations disabled on remote. Set SYMFONY_DIAG_ENABLE_MUTATIONS=1.', $meta);
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' cache:warmup --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.messenger_stop_workers': {
+    if (!$enableMutations) respond(false, 'Refused: mutations disabled on remote. Set SYMFONY_DIAG_ENABLE_MUTATIONS=1.', $meta);
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' messenger:stop-workers --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  case 'console.messenger_failed_retry': {
+    if (!$enableMutations) respond(false, 'Refused: mutations disabled on remote. Set SYMFONY_DIAG_ENABLE_MUTATIONS=1.', $meta);
+
+    $targets = $params['targets'] ?? 'all';
+    $transport = $params['transport'] ?? null;
+    if (!is_string($targets) || trim($targets) === '' || strlen($targets) > 500) {
+      respond(false, 'Invalid targets param.', $meta);
+    }
+    if ($transport !== null && !is_string($transport)) respond(false, 'Invalid transport param.', $meta);
+    if (!safeCliName($transport)) respond(false, 'Invalid transport name.', $meta);
+
+    $rawTokens = preg_split('/[\s,]+/', trim($targets)) ?: [];
+    $tokens = array_values(array_filter($rawTokens, fn($v) => is_string($v) && $v !== ''));
+    if (count($tokens) === 0) respond(false, 'Invalid targets param.', $meta);
+
+    $retryArgs = [];
+    $hasAll = false;
+    foreach ($tokens as $token) {
+      $t = strtolower($token);
+      if ($t === 'all') {
+        $hasAll = true;
+        continue;
+      }
+      // Prevent injecting console options (no leading '-')
+      if (str_starts_with($token, '-')) {
+        respond(false, "Invalid target token: {$token}", $meta);
+      }
+      // Allow numeric IDs and UUID-like tokens.
+      if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/', $token)) {
+        respond(false, "Invalid target token: {$token}", $meta);
+      }
+      $retryArgs[] = $token;
+    }
+
+    if ($hasAll && count($retryArgs) > 0) {
+      respond(false, 'Invalid targets: use either `all` or explicit IDs.', $meta);
+    }
+    if ($hasAll) $retryArgs = ['all'];
+
+    $safeArgs = array_map(fn($id) => escapeshellarg((string)$id), $retryArgs);
+    $argStr = implode(' ', $safeArgs);
+    $transportOpt = ($transport !== null && trim($transport) !== '') ? (' --transport=' . escapeshellarg($transport)) : '';
+
+    $envPrefix = 'APP_ENV=' . escapeshellarg($appEnv) . ' APP_DEBUG=' . escapeshellarg($appDebug ? '1' : '0');
+    $inner = 'cd ' . escapeshellarg($appDir) . ' && ' . $envPrefix . ' ' . escapeshellarg($phpBin) . ' ' . escapeshellarg($console) . ' messenger:failed:retry ' . $argStr . $transportOpt . ' --no-ansi --no-interaction';
+    $res = runCommand('sh -lc ' . escapeshellarg($inner), $timeoutSec, $maxOutput);
+    $out = trim((string)($res['stdout'] ?? '') . "\n" . (string)($res['stderr'] ?? ''));
+    $ok = (bool)($res['ok'] ?? false);
+    break;
+  }
+
+  default:
+    respond(false, "Unknown or disabled action: {$action}", $meta);
+}
+
+$out = redact($out);
+$out = truncate($out, $maxOutput);
+
+respond($ok, $out, $meta);
