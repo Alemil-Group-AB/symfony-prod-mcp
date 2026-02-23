@@ -165,7 +165,46 @@ SYMFONY_DIAG_MAX_OUTPUT_CHARS=200000
 SYMFONY_DIAG_ENABLE_MUTATIONS=0
 ```
 
-> Note: Symfony doesn't ship a built-in `/up` endpoint like Laravel. Create a lightweight readiness route yourself and point `SYMFONY_DIAG_READY_URL` at it.
+### Symfony endpoint for `health`/`ready` (recommended)
+
+Symfony ships no built-in `/up` route. Add your own infrastructure controller and point
+`SYMFONY_DIAG_READY_URL` to `/ready` (or `/health` if you only need a shallow check).
+
+Minimal contract:
+
+```php
+#[Route('/health', methods: ['GET'])]
+public function health(): Response
+{
+    return new Response('OK', Response::HTTP_OK, ['Content-Type' => 'text/plain']);
+}
+
+#[Route('/ready', methods: ['GET'])]
+public function ready(): JsonResponse
+{
+    $checks = [
+        ['name' => 'global_database', 'status' => 'ok', 'duration_ms' => 3, 'details' => ['ping' => 1]],
+        ['name' => 'tenant_database', 'status' => 'ok', 'duration_ms' => 4, 'details' => ['ping' => 1]],
+    ];
+
+    $ready = array_reduce($checks, static fn (bool $carry, array $check): bool => $carry && 'ok' === $check['status'], true);
+
+    return new JsonResponse(
+        ['status' => $ready ? 'ready' : 'not_ready', 'checks' => $checks],
+        $ready ? Response::HTTP_OK : Response::HTTP_SERVICE_UNAVAILABLE
+    );
+}
+```
+
+Your fuller controller example (DB, Messenger, Elasticsearch, Mailer checks) fits this pattern well.
+
+### What the MCP `health` / `ready` tools expect
+
+- URL from `SYMFONY_DIAG_READY_URL` (fallback: `SYMFONY_DIAG_HEALTH_URL`)
+- **HTTP status 200** means success
+- Any non-200 status means not ready/fail
+- Response body is ignored by the runner (`curl -o /dev/null`), so status code is authoritative
+- Proxy env vars are ignored on purpose (`--noproxy '*'`) so checks stay loopback-local
 
 ### 4) SSH hardening (strongly recommended)
 Put your public key in `~codexdiag/.ssh/authorized_keys` and use **forced command**.
