@@ -8,14 +8,30 @@ export function registerHealthTools(server: McpServer, ssh: SshConfig) {
     "health",
     {
       description:
-        "Check a configured Symfony health endpoint (default: http://127.0.0.1/health) from the server (loopback only).",
+        "Check a configured Symfony readiness endpoint (default: http://127.0.0.1:8000/ready) from the server (loopback only).",
       inputSchema: {
         // Allow overriding, but remote runner will restrict this to loopback-only URLs.
-        url: z.string().url().optional().describe("Optional health URL (loopback only)."),
+        url: z.string().url().optional().describe("Optional readiness URL (loopback only)."),
       },
     },
     async ({ url }) => {
       const res = await runDiag(ssh, "health", url ? { url } : undefined);
+      return asTextResult(res.output);
+    },
+  );
+
+  server.registerTool(
+    "ready",
+    {
+      description:
+        "Check a configured Symfony readiness endpoint (default: http://127.0.0.1:8000/ready) from the server (loopback only).",
+      inputSchema: {
+        // Allow overriding, but remote runner will restrict this to loopback-only URLs.
+        url: z.string().url().optional().describe("Optional readiness URL (loopback only)."),
+      },
+    },
+    async ({ url }) => {
+      const res = await runDiag(ssh, "ready", url ? { url } : undefined);
       return asTextResult(res.output);
     },
   );

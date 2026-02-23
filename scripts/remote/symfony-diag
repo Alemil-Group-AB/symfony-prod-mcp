@@ -252,13 +252,29 @@ function encodeJsonPretty(array $payload): string {
   return $encoded;
 }
 
-function isSafeLoopbackUrl(string $url): bool {
+function isLoopbackHost(string $host): bool {
+  return $host === '127.0.0.1' || $host === 'localhost' || $host === '::1' || $host === '[::1]';
+}
+
+/**
+ * Validate health URL.
+ * - Always allows loopback hosts.
+ * - Optionally allows ONE configured SNI host (used together with curl --resolve to loop back to 127.0.0.1).
+ */
+function isSafeLoopbackUrl(string $url, ?string $allowedSniHost = null): bool {
   $parts = parse_url($url);
   if ($parts === false) return false;
+
   $scheme = $parts['scheme'] ?? '';
   $host = $parts['host'] ?? '';
   if ($scheme !== 'http' && $scheme !== 'https') return false;
-  if ($host === '127.0.0.1' || $host === 'localhost' || $host === '::1' || $host === '[::1]') return true;
+
+  if (isLoopbackHost($host)) return true;
+
+  if ($allowedSniHost !== null && $allowedSniHost !== '' && $host === $allowedSniHost) {
+    return true;
+  }
+
   return false;
 }
 
@@ -588,7 +604,13 @@ $appDir = requireEnv('SYMFONY_DIAG_APP_DIR');
 if (!is_dir($appDir)) respond(false, "Invalid app dir: {$appDir}");
 
 $logDir = envValue('SYMFONY_DIAG_LOG_DIR', $appDir . '/var/log') ?? ($appDir . '/var/log');
-$healthUrl = envValue('SYMFONY_DIAG_HEALTH_URL', 'http://127.0.0.1/health') ?? 'http://127.0.0.1/health';
+$healthUrl = envValue(
+  'SYMFONY_DIAG_READY_URL',
+  envValue('SYMFONY_DIAG_HEALTH_URL', 'http://127.0.0.1:8000/ready'),
+) ?? 'http://127.0.0.1:8000/ready';
+$healthSniHost = envValue('SYMFONY_DIAG_HEALTH_SNI_HOST', null);
+$healthInsecureVal = strtolower(envValue('SYMFONY_DIAG_HEALTH_INSECURE', '0') ?? '0');
+$healthInsecure = in_array($healthInsecureVal, ['1', 'true', 'yes', 'on'], true);
 $phpBin = envValue('SYMFONY_DIAG_PHP_BIN', 'php') ?? 'php';
 $console = envValue('SYMFONY_DIAG_CONSOLE', $appDir . '/bin/console') ?? ($appDir . '/bin/console');
 
@@ -609,20 +631,64 @@ $out = '';
 $ok = true;
 
 switch ($action) {
-  case 'health': {
-    $url = $params['url'] ?? $healthUrl;
-    if (!is_string($url) || !isSafeLoopbackUrl($url)) {
-      respond(false, 'Refused: health url must be loopback (127.0.0.1/localhost/::1).', $meta);
+  case 'health':
+  case 'ready': {
+    $url = $healthUrl;
+
+    // Allow overriding the URL ONLY when the configured health URL is loopback (safe for dev).
+    if (isset($params['url']) && is_string($params['url'])) {
+      $cfgParts = parse_url($healthUrl);
+      $cfgHost = (is_array($cfgParts) ? ($cfgParts['host'] ?? '') : '');
+      if (isLoopbackHost($cfgHost) && isSafeLoopbackUrl($params['url'], null)) {
+        $url = $params['url'];
+      }
     }
+
+    $parts = parse_url($url);
+    if ($parts === false) {
+      respond(false, 'Invalid health URL.', $meta);
+    }
+
+    $scheme = $parts['scheme'] ?? '';
+    $host = $parts['host'] ?? '';
+    $port = (int)($parts['port'] ?? (($scheme === 'https') ? 443 : 80));
+
+    // If the host is not loopback, we ONLY permit HTTPS with a configured SNI host,
+    // and we force the TCP connection to loop back via curl --resolve.
+    $allowedSniHost = $healthSniHost;
+    if (($allowedSniHost === null || $allowedSniHost === '') && !isLoopbackHost($host)) {
+      $allowedSniHost = $host;
+    }
+
+    if (!isSafeLoopbackUrl($url, $allowedSniHost)) {
+      respond(false, 'Refused: health url must be loopback (127.0.0.1/localhost/::1) or the configured SNI host (with --resolve).', $meta);
+    }
+
+    if (!isLoopbackHost($host) && $scheme !== 'https') {
+      respond(false, 'Refused: non-loopback health host requires https.', $meta);
+    }
+
+    // Force direct local egress for readiness checks (ignore proxy env vars).
+    $curl = "curl --noproxy '*' -fsS -o /dev/null -m 10 -w '%{http_code}'";
+    if ($scheme === 'https' && $healthInsecure) {
+      $curl .= ' -k';
+    }
+    if (!isLoopbackHost($host)) {
+      // Force local connect while keeping SNI/Host = $host (certificate matches).
+      $curl .= ' --resolve ' . escapeshellarg($host . ':' . $port . ':127.0.0.1');
+    }
+    $curl .= ' ' . escapeshellarg($url);
+
     // Prefer curl if available.
-    $cmd = "command -v curl >/dev/null 2>&1 && curl -fsS -o /dev/null -m 10 -w '%{http_code}' " . escapeshellarg($url);
+    $cmd = 'command -v curl >/dev/null 2>&1 && ' . $curl;
     $res = runCommand('sh -lc ' . escapeshellarg($cmd), $timeoutSec, $maxOutput);
     $code = trim((string)($res['stdout'] ?? ''));
     if (($res['ok'] ?? false) && $code === '200') {
       $out = "OK (HTTP 200) - {$url}";
       $ok = true;
     } else {
-      $out = "FAIL (HTTP {$code}) - {$url}\n" . trim((string)($res['stderr'] ?? ''));
+      $out = "FAIL (HTTP {$code}) - {$url}
+" . trim((string)($res['stderr'] ?? ''));
       $ok = false;
     }
     break;
