@@ -14,7 +14,8 @@ A **production-safe MCP server** (STDIO) that lets **Codex CLI** run *common, re
 ## What you get (tools)
 
 ### App / Symfony
-- `health` — checks a configured health endpoint (loopback only)
+- `health` — checks a configured readiness endpoint (loopback by default, HTTPS with SNI-resolve supported)
+- `ready` — checks a configured readiness endpoint (alias to the readiness check)
 - `console_version` — `php bin/console --version`
 - `console_about` — `php bin/console about`
 - `console_debug_router` — `php bin/console debug:router`
@@ -68,7 +69,7 @@ Both are **double-gated**:
 
 ### Remote (production host)
 - PHP CLI available (for the runner)
-- Common utilities: `sh`, `tail`, `grep`, `df`, `ps`, `curl` (curl recommended for `health`)
+- Common utilities: `sh`, `tail`, `grep`, `df`, `ps`, `curl` (curl recommended for endpoint checks)
 - A dedicated locked-down user (recommended)
 
 ---
@@ -142,7 +143,17 @@ SYMFONY_DIAG_APP_DIR=/var/www/myapp/current
 SYMFONY_DIAG_LOG_DIR=/var/www/myapp/current/var/log
 SYMFONY_DIAG_CONSOLE=/var/www/myapp/current/bin/console
 SYMFONY_DIAG_PHP_BIN=php
-SYMFONY_DIAG_HEALTH_URL=http://127.0.0.1/health
+
+# Readiness checks default to loopback:
+SYMFONY_DIAG_READY_URL=http://127.0.0.1:8000/ready
+# If your production readiness endpoint is HTTPS-only on a public host, use:
+# SYMFONY_DIAG_READY_URL=https://example.com/ready
+# SYMFONY_DIAG_HEALTH_SNI_HOST=example.com
+# Note: readiness checks ignore proxy env vars to keep checks loopback-local.
+# Optionally disable TLS checks for local loopback-only HTTPS fallback:
+# SYMFONY_DIAG_HEALTH_INSECURE=1
+# Backward compatibility:
+# SYMFONY_DIAG_HEALTH_URL=http://127.0.0.1:8000/ready
 
 # Optional: Symfony kernel/bootstrap (if your app is non-standard)
 SYMFONY_DIAG_KERNEL_CLASS=App\\Kernel
@@ -154,7 +165,46 @@ SYMFONY_DIAG_MAX_OUTPUT_CHARS=200000
 SYMFONY_DIAG_ENABLE_MUTATIONS=0
 ```
 
-> Note: Symfony doesn't ship a built-in `/up` endpoint like Laravel. Create a lightweight health route yourself and point `SYMFONY_DIAG_HEALTH_URL` at it.
+### Symfony endpoint for `health`/`ready` (recommended)
+
+Symfony ships no built-in `/up` route. Add your own infrastructure controller and point
+`SYMFONY_DIAG_READY_URL` to `/ready` (or `/health` if you only need a shallow check).
+
+Minimal contract:
+
+```php
+#[Route('/health', methods: ['GET'])]
+public function health(): Response
+{
+    return new Response('OK', Response::HTTP_OK, ['Content-Type' => 'text/plain']);
+}
+
+#[Route('/ready', methods: ['GET'])]
+public function ready(): JsonResponse
+{
+    $checks = [
+        ['name' => 'global_database', 'status' => 'ok', 'duration_ms' => 3, 'details' => ['ping' => 1]],
+        ['name' => 'tenant_database', 'status' => 'ok', 'duration_ms' => 4, 'details' => ['ping' => 1]],
+    ];
+
+    $ready = array_reduce($checks, static fn (bool $carry, array $check): bool => $carry && 'ok' === $check['status'], true);
+
+    return new JsonResponse(
+        ['status' => $ready ? 'ready' : 'not_ready', 'checks' => $checks],
+        $ready ? Response::HTTP_OK : Response::HTTP_SERVICE_UNAVAILABLE
+    );
+}
+```
+
+Your fuller controller example (DB, Messenger, Elasticsearch, Mailer checks) fits this pattern well.
+
+### What the MCP `health` / `ready` tools expect
+
+- URL from `SYMFONY_DIAG_READY_URL` (fallback: `SYMFONY_DIAG_HEALTH_URL`)
+- **HTTP status 200** means success
+- Any non-200 status means not ready/fail
+- Response body is ignored by the runner (`curl -o /dev/null`), so status code is authoritative
+- Proxy env vars are ignored on purpose (`--noproxy '*'`) so checks stay loopback-local
 
 ### 4) SSH hardening (strongly recommended)
 Put your public key in `~codexdiag/.ssh/authorized_keys` and use **forced command**.
@@ -219,6 +269,7 @@ tool_timeout_sec = 60
 
 enabled_tools = [
   "health",
+  "ready",
   "logs_list",
   "logs_tail",
   "logs_grep",
@@ -270,9 +321,13 @@ If you use forced-command, running `ssh codexdiag@prod.example.com` will wait fo
 
 ### `health` fails
 - Confirm `curl` exists on the server.
-- Confirm the health URL is loopback and reachable from the server:
+- Confirm the configured health URL is reachable from the server:
   ```bash
-  curl -i http://127.0.0.1/health
+  curl -i --noproxy '*' http://127.0.0.1:8000/ready
+  ```
+- If HTTPS + SNI host is configured, emulate the same routing with `curl --resolve`:
+  ```bash
+  curl -i --noproxy '*' --resolve example.com:443:127.0.0.1 https://example.com/ready
   ```
 
 ### Doctrine tools fail
